@@ -2255,16 +2255,14 @@ class ShiftScheduleTalkAPIView(PluginActiveMixin, TeamShiftsPermissionRequiredMi
                 except (TypeError, ValueError, OverflowError):
                     return HttpResponseBadRequest("Invalid date format for 'start'/'end'.")
 
-                if "room" in data:
-                    room_id = data["room"]
-                    if isinstance(room_id, dict):
-                        room_id = room_id.get("id")
-                    shift.location = ShiftLocation.objects.filter(id=room_id, event=event).first() if room_id else None
-
                 if shift.start_time and shift.end_time and shift.end_time <= shift.start_time:
                     return HttpResponseBadRequest("'end' must be after 'start'.")
-            else:
-                shift.location = None
+
+            if "room" in data:
+                room_id = data["room"]
+                if isinstance(room_id, dict):
+                    room_id = room_id.get("id")
+                shift.location = ShiftLocation.objects.filter(id=room_id, event=event).first() if room_id else None
 
             if "title" in data:
                 title_val = data["title"]
@@ -2308,7 +2306,13 @@ class ShiftScheduleTalkAPIView(PluginActiveMixin, TeamShiftsPermissionRequiredMi
                 if role_id:
                     ShiftRoleAssignment.objects.create(shift=shift, role_id=role_id, capacity=data.get("capacity", 1))
 
-            return JsonResponse({"status": "ok"})
+            shift = Shift.objects.prefetch_related(
+                "role_assignments__role",
+                "assignments__team_member",
+                "assignments__role",
+                "assignments__assigned_by",
+            ).get(pk=shift.pk)
+            return JsonResponse({"status": "ok", "talk": _shift_talk_payload(shift)})
 
     def delete(self, request, *args, **kwargs):
         event = request.event
@@ -2335,6 +2339,10 @@ class ShiftScheduleMembersAPIView(PluginActiveMixin, TeamShiftsPermissionRequire
                         member["email"] = app.user.email
                     members.append(member)
             return JsonResponse({"members": members})
+
+
+def _lock_member_for_overlap_check(user):
+    User.objects.select_for_update().get(pk=user.pk)
 
 
 def _queue_lifecycle_email_safely(application, template_role):
@@ -2430,50 +2438,58 @@ class ShiftScheduleAssignmentsAPIView(PluginActiveMixin, TeamShiftsPermissionReq
                     status=400,
                 )
 
-            # Capacity check: ensure assignment won't exceed role capacity
-            if role_id_provided:
-                role_assignment = shift.role_assignments.filter(role_id=role_id).first()
-                if role_assignment:
-                    current_count = ShiftAssignment.objects.filter(shift=shift, role_id=role_id).exclude(team_member=user).count()
-                    if current_count >= role_assignment.capacity:
+            with transaction.atomic():
+                Shift.objects.select_for_update().get(pk=shift.pk, event=event)
+                if role_id_provided:
+                    role_assignment = shift.role_assignments.select_for_update().filter(role_id=role_id).first()
+                    if role_assignment:
+                        current_count = ShiftAssignment.objects.filter(shift=shift, role_id=role_id).exclude(team_member=user).count()
+                        if current_count >= role_assignment.capacity:
+                            return JsonResponse(
+                                {"detail": "Role capacity has been reached for this shift."},
+                                status=400,
+                            )
+
+                _lock_member_for_overlap_check(user)
+                if shift.start_time and shift.end_time:
+                    conflicting = (
+                        ShiftAssignment.objects.filter(
+                            team_member=user,
+                            shift__event=event,
+                            shift__start_time__lt=shift.end_time,
+                            shift__end_time__gt=shift.start_time,
+                        )
+                        .exclude(shift=shift)
+                        .select_related("shift")
+                        .first()
+                    )
+                    if conflicting:
                         return JsonResponse(
-                            {"detail": "Role capacity has been reached for this shift."},
+                            {"detail": "Member is already assigned to another shift during this time."},
                             status=400,
                         )
 
-            if shift.start_time and shift.end_time:
-                conflicting = (
-                    ShiftAssignment.objects.filter(
-                        team_member=user,
-                        shift__event=event,
-                        shift__start_time__lt=shift.end_time,
-                        shift__end_time__gt=shift.start_time,
-                    )
-                    .exclude(shift=shift)
-                    .select_related("shift")
-                    .first()
+                previous_role_id = ShiftAssignment.objects.filter(shift=shift, team_member=user).values_list("role_id", flat=True).first()
+                assignment, created = ShiftAssignment.objects.update_or_create(
+                    shift=shift,
+                    team_member=user,
+                    defaults={"role_id": role_id, "assigned_by": request.user},
                 )
-                if conflicting:
-                    return JsonResponse(
-                        {"detail": "Member is already assigned to another shift during this time."},
-                        status=400,
+                if created or previous_role_id != role_id:
+                    shift_role_assignment = shift.role_assignments.select_related("role").filter(role_id=role_id).first() if role_id else None
+                    role = shift_role_assignment.role if shift_role_assignment else None
+                    transaction.on_commit(
+                        lambda event=event, user=user, shift=shift, role=role: _notify_shift_change_safely(
+                            event, user, shift, role, EmailTemplateRoles.SHIFT_ASSIGNED_BY_ORGANIZER
+                        )
                     )
-
-            previous_role_id = ShiftAssignment.objects.filter(shift=shift, team_member=user).values_list("role_id", flat=True).first()
-            assignment, created = ShiftAssignment.objects.update_or_create(
-                shift=shift,
-                team_member=user,
-                defaults={"role_id": role_id, "assigned_by": request.user},
-            )
-            if created or previous_role_id != role_id:
-                shift_role_assignment = shift.role_assignments.select_related("role").filter(role_id=role_id).first() if role_id else None
-                role = shift_role_assignment.role if shift_role_assignment else None
-                transaction.on_commit(
-                    lambda event=event, user=user, shift=shift, role=role: _notify_shift_change_safely(
-                        event, user, shift, role, EmailTemplateRoles.SHIFT_ASSIGNED_BY_ORGANIZER
-                    )
-                )
-            return JsonResponse({"status": "ok"})
+            shift = Shift.objects.prefetch_related(
+                "role_assignments__role",
+                "assignments__team_member",
+                "assignments__role",
+                "assignments__assigned_by",
+            ).get(pk=shift.pk)
+            return JsonResponse({"status": "ok", "roles": _shift_roles_payload(shift)})
 
     def delete(self, request, *args, **kwargs):
         event = request.event
@@ -2507,7 +2523,13 @@ class ShiftScheduleAssignmentsAPIView(PluginActiveMixin, TeamShiftsPermissionReq
             assignment = ShiftAssignment.objects.filter(shift=shift, team_member_id=user_id, role_id=role_id).first()
             if assignment:
                 assignment.delete()
-            return JsonResponse({"status": "ok"})
+            shift = Shift.objects.prefetch_related(
+                "role_assignments__role",
+                "assignments__team_member",
+                "assignments__role",
+                "assignments__assigned_by",
+            ).get(pk=shift.pk)
+            return JsonResponse({"status": "ok", "roles": _shift_roles_payload(shift)})
 
 
 class ShiftScheduleAvailabilitiesAPIView(PluginActiveMixin, TeamShiftsPermissionRequiredMixin, View):
@@ -2809,6 +2831,7 @@ class PublicShiftScheduleAPIView(PublicShiftScheduleMixin, View):
                 "mode": "shifts",
                 "current_user_id": request.user.pk,
                 "current_user_name": request.user.get_full_name() or request.user.email,
+                "can_manage_shifts": has_teamshifts_permission(request.user, request.organizer, event, "can_teamshifts_create_shifts", request=request),
                 "shift_action_emails": _saved_shift_action_emails(self._email_choice_application()),
                 "event_start": event.date_from.isoformat() if event.date_from else "",
                 "event_end": event.date_to.isoformat() if event.date_to else "",
@@ -2852,6 +2875,8 @@ class PublicShiftScheduleView(PublicShiftScheduleMixin, TemplateView):
         with scope(event=event):
             locations = list(event.shift_locations.select_related("linked_room").all())
             shifts = list(_public_shifts_queryset(event))
+            roles = [{"id": role.id, "name": {"en": role.name}, "is_restricted": role.is_restricted} for role in event.team_roles.all()]
+            can_manage_shifts = has_teamshifts_permission(self.request.user, self.organizer, event, "can_teamshifts_create_shifts", request=self.request)
 
         rooms = [_serialize_location_room(loc) for loc in locations if _location_is_available(loc)]
 
@@ -2859,9 +2884,11 @@ class PublicShiftScheduleView(PublicShiftScheduleMixin, TemplateView):
             "mode": "shifts",
             "current_user_id": self.request.user.pk,
             "current_user_name": self.request.user.get_full_name() or self.request.user.email,
+            "can_manage_shifts": can_manage_shifts,
             "shift_action_emails": _saved_shift_action_emails(self._email_choice_application()),
             "talks": [_shift_talk_payload(shift) for shift in shifts],
             "rooms": rooms,
+            "roles": roles,
             "tracks": [],
             "speakers": [],
             "version": None,
@@ -2925,6 +2952,7 @@ class ShiftClaimView(PublicShiftScheduleMixin, View):
                 current_count = ShiftAssignment.objects.filter(shift=shift, role_id=sra.role_id).exclude(team_member=request.user).count()
                 if current_count >= sra_locked.capacity:
                     return fail(_("Sorry, this role is now full."))
+                _lock_member_for_overlap_check(request.user)
                 if shift.start_time and shift.end_time:
                     conflicting = (
                         ShiftAssignment.objects.filter(
