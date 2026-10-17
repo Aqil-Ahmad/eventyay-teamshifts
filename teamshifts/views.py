@@ -31,9 +31,11 @@ from eventyay.base.i18n import LazyI18nString, language
 from eventyay.base.models import Event, User
 from eventyay.base.templatetags.rich_text import compile_email_body, rich_text
 from eventyay.common.text.phrases import phrases
+from eventyay.control.forms.orders import ExporterForm
 from eventyay.control.views import PaginationMixin
 from eventyay.multidomain.urlreverse import build_absolute_uri
 
+from .exporters import EXPORT_FORMAT_CSV, EXPORT_FORMAT_XLSX, MembersExporter
 from .forms import (
     MAX_SHIFTS_PER_ACTION,
     MIN_FINAL_SHIFT_MINUTES,
@@ -1895,11 +1897,10 @@ class ShiftDeleteView(PluginActiveMixin, TeamShiftsPermissionRequiredMixin, Dele
         return super().delete(request, *args, **kwargs)
 
 
-class MembersListView(PluginActiveMixin, TeamShiftsPermissionRequiredMixin, PaginationMixin, ListView):
-    permission = None
-    template_name = "teamshifts/members.html"
-    context_object_name = "members"
+MAX_DB_INTEGER = 2147483647
 
+
+class MembersQuerysetMixin:
     def get_queryset(self):
         event = self.request.event
         with scope(event=event):
@@ -1912,6 +1913,10 @@ class MembersListView(PluginActiveMixin, TeamShiftsPermissionRequiredMixin, Pagi
                     qs = qs.filter(Q(user__email__icontains=search) | Q(user__fullname__icontains=search))
                 else:
                     qs = qs.filter(Q(user__fullname__icontains=search))
+
+            role_id = self._parse_role_id(self.request.GET.get("role", ""))
+            if role_id is not None:
+                qs = qs.filter(user_id__in=ShiftAssignment.objects.filter(shift__event=event, role_id=role_id).values("team_member_id"))
 
             # The voucher filter is only shown while vouchers are enabled, so only apply it then.
             voucher_status = self.request.GET.get("voucher", "")
@@ -1954,6 +1959,14 @@ class MembersListView(PluginActiveMixin, TeamShiftsPermissionRequiredMixin, Pagi
         return qs
 
     @staticmethod
+    def _parse_role_id(raw):
+        raw = raw.strip()
+        if not (raw.isascii() and raw.isdigit()):
+            return None
+        value = int(raw)
+        return value if value <= MAX_DB_INTEGER else None
+
+    @staticmethod
     def _voucher_status_filter(voucher_status):
         # A redeemed voucher counts as claimed even before its status has been synced.
         claimed = Q(voucher_assignment__status=VoucherStatus.CLAIMED) | Q(voucher_assignment__voucher__redeemed__gt=0)
@@ -1973,6 +1986,12 @@ class MembersListView(PluginActiveMixin, TeamShiftsPermissionRequiredMixin, Pagi
     def _vouchers_enabled(voucher_settings):
         return bool(voucher_settings and voucher_settings.enabled and voucher_settings.voucher_tag)
 
+
+class MembersListView(PluginActiveMixin, TeamShiftsPermissionRequiredMixin, MembersQuerysetMixin, PaginationMixin, ListView):
+    permission = None
+    template_name = "teamshifts/members.html"
+    context_object_name = "members"
+
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
         event = self.request.event
@@ -1988,6 +2007,15 @@ class MembersListView(PluginActiveMixin, TeamShiftsPermissionRequiredMixin, Pagi
             "can_teamshifts_manage_applicants",
             request=self.request,
         )
+        ctx["can_download_members"] = ctx["can_add_member"]
+        if ctx["can_download_members"]:
+            download_url = reverse(
+                "plugins:teamshifts:members_download",
+                kwargs={"organizer": self.request.organizer.slug, "event": self.request.event.slug},
+            )
+            filters = {key: self.request.GET[key].strip() for key in ("q", "role", "voucher") if self.request.GET.get(key, "").strip()}
+            ctx["download_xlsx_url"] = f"{download_url}?{urlencode({**filters, '_format': EXPORT_FORMAT_XLSX})}"
+            ctx["download_csv_url"] = f"{download_url}?{urlencode({**filters, '_format': EXPORT_FORMAT_CSV})}"
 
         voucher_settings = self._get_voucher_settings()
         ctx["vouchers_enabled"] = self._vouchers_enabled(voucher_settings)
@@ -2008,6 +2036,24 @@ class MembersListView(PluginActiveMixin, TeamShiftsPermissionRequiredMixin, Pagi
             ctx["voucher_batch_empty"] = False
 
         return ctx
+
+
+class MembersExportView(PluginActiveMixin, TeamShiftsPermissionRequiredMixin, MembersQuerysetMixin, View):
+    permission = "can_teamshifts_manage_applicants"
+
+    def get(self, request, *args, **kwargs):
+        event = request.event
+        with scope(event=event):
+            exporter = MembersExporter(event, list(self.get_queryset()))
+        form = ExporterForm(data={"_format": request.GET.get("_format", EXPORT_FORMAT_XLSX)})
+        form.fields = exporter.export_form_fields
+        if not form.is_valid():
+            return HttpResponseBadRequest("Unsupported export format.")
+        filename, content_type, payload = exporter.render(form.cleaned_data)
+        response = HttpResponse(payload, content_type=content_type)
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        response["Cache-Control"] = "no-store"
+        return response
 
 
 class MemberCreateView(PluginActiveMixin, TeamShiftsPermissionRequiredMixin, FormView):
