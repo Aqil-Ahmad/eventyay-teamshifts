@@ -30,6 +30,7 @@ from django_scopes import scope, scopes_disabled
 from eventyay.base.i18n import LazyI18nString, language
 from eventyay.base.models import Event, User
 from eventyay.base.templatetags.rich_text import compile_email_body, rich_text
+from eventyay.base.views.tasks import AsyncAction
 from eventyay.common.text.phrases import phrases
 from eventyay.control.forms.orders import ExporterForm
 from eventyay.control.views import PaginationMixin
@@ -61,6 +62,7 @@ from .models import (
     CFM_LOCKED_FIELDS,
     ApplicationStatus,
     CallForTeamMembers,
+    CertificateStatus,
     EmailTemplateRoles,
     MemberVoucher,
     Shift,
@@ -86,7 +88,7 @@ from .permissions import (
     has_any_teamshifts_permission,
     has_teamshifts_permission,
 )
-from .services.certificates import maybe_auto_issue_certificate
+from .services.certificates import maybe_auto_issue_certificate, send_selected_certificates_task
 from .services.checkin import evaluate_shift_certificate, stamp_shift_end
 from .services.email import (
     DraftNoLongerEditable,
@@ -2015,7 +2017,7 @@ class MembersQuerysetMixin:
     def get_queryset(self):
         event = self.request.event
         with scope(event=event):
-            qs = TeamMemberApplication.objects.filter(event=event, status=ApplicationStatus.ACCEPTED).select_related("user")
+            qs = TeamMemberApplication.objects.filter(event=event, status=ApplicationStatus.ACCEPTED).select_related("user", "certificate")
 
             search = self.request.GET.get("q", "").strip()
             if search:
@@ -2033,6 +2035,10 @@ class MembersQuerysetMixin:
             voucher_status = self.request.GET.get("voucher", "")
             if voucher_status in VoucherStatus.values and self._vouchers_enabled(self._get_voucher_settings()):
                 qs = qs.filter(self._voucher_status_filter(voucher_status))
+
+            certificate_status = self.request.GET.get("certificate", "")
+            if certificate_status in CertificateStatus.values:
+                qs = qs.filter(self._certificate_status_filter(certificate_status))
 
             qs = (
                 qs.annotate(
@@ -2087,6 +2093,21 @@ class MembersQuerysetMixin:
             return Q(voucher_assignment__status=VoucherStatus.SENT) & ~claimed
         return (Q(voucher_assignment__isnull=True) | Q(voucher_assignment__status=VoucherStatus.NOT_SENT)) & ~claimed
 
+    @staticmethod
+    def _certificate_status_filter(certificate_status):
+        downloaded = Q(certificate__downloaded_at__isnull=False)
+        sent = Q(certificate__notified_at__isnull=False) & ~downloaded
+        generated = (
+            Q(certificate__file__isnull=False) & ~Q(certificate__file="") & Q(certificate__notified_at__isnull=True, certificate__downloaded_at__isnull=True)
+        )
+        if certificate_status == CertificateStatus.DOWNLOADED:
+            return downloaded
+        if certificate_status == CertificateStatus.SENT:
+            return sent
+        if certificate_status == CertificateStatus.GENERATED:
+            return generated
+        return ~downloaded & ~sent & ~generated
+
     def _get_voucher_settings(self):
         try:
             return self.request.event.volunteer_voucher_settings
@@ -2109,6 +2130,7 @@ class MembersListView(PluginActiveMixin, TeamShiftsPermissionRequiredMixin, Memb
         with scope(event=event):
             ctx["roles"] = list(TeamRole.objects.filter(event=event))
         ctx["voucher_status_choices"] = VoucherStatus.choices
+        ctx["certificate_status_choices"] = CertificateStatus.choices
 
         ctx["can_view_email"] = can_view_email_addresses(self.request.user, self.request.organizer, self.request.event, request=self.request)
         ctx["can_add_member"] = has_teamshifts_permission(
@@ -2124,7 +2146,7 @@ class MembersListView(PluginActiveMixin, TeamShiftsPermissionRequiredMixin, Memb
                 "plugins:teamshifts:members_download",
                 kwargs={"organizer": self.request.organizer.slug, "event": self.request.event.slug},
             )
-            filters = {key: self.request.GET[key].strip() for key in ("q", "role", "voucher") if self.request.GET.get(key, "").strip()}
+            filters = {key: self.request.GET[key].strip() for key in ("q", "role", "voucher", "certificate") if self.request.GET.get(key, "").strip()}
             ctx["download_xlsx_url"] = f"{download_url}?{urlencode({**filters, '_format': EXPORT_FORMAT_XLSX})}"
             ctx["download_csv_url"] = f"{download_url}?{urlencode({**filters, '_format': EXPORT_FORMAT_CSV})}"
 
@@ -3484,6 +3506,7 @@ class MyShiftsGlobalView(LoginRequiredMixin, TemplateView):
 
             cert_event_ids = set(
                 MemberCertificate.objects.filter(
+                    Q(notified_at__isnull=False) | Q(downloaded_at__isnull=False),
                     application__user=self.request.user,
                     application__event_id__in=event_ids,
                     file__isnull=False,
@@ -3507,7 +3530,7 @@ class MyShiftsCertificateDownloadView(LoginRequiredMixin, View):
         if not application:
             raise Http404
         certificate = getattr(application, "certificate", None)
-        if not certificate or not certificate.file:
+        if not certificate or not certificate.file or certificate.status not in (CertificateStatus.SENT, CertificateStatus.DOWNLOADED):
             raise Http404
         response = FileResponse(
             certificate.file.open("rb"),
@@ -3517,6 +3540,61 @@ class MyShiftsCertificateDownloadView(LoginRequiredMixin, View):
         certificate.downloaded_at = now()
         certificate.save(update_fields=["downloaded_at"])
         return response
+
+
+class BulkSendCertificatesView(PluginActiveMixin, TeamShiftsPermissionRequiredMixin, AsyncAction, View):
+    permission = "can_teamshifts_manage_applicants"
+    task = send_selected_certificates_task
+
+    def get_success_url(self, value):
+        return reverse("plugins:teamshifts:members", kwargs={"organizer": self.request.organizer.slug, "event": self.request.event.slug})
+
+    def get_error_url(self):
+        return self.get_success_url(None)
+
+    def get_success_message(self, value):
+        parts = []
+        if value["sent"]:
+            parts.append(ngettext("Certificate sent to %(count)d member.", "Certificates sent to %(count)d members.", value["sent"]) % {"count": value["sent"]})
+        if value["resent"]:
+            parts.append(
+                ngettext("Certificate resent to %(count)d member.", "Certificates resent to %(count)d members.", value["resent"]) % {"count": value["resent"]}
+            )
+        if value["not_qualified"]:
+            parts.append(
+                ngettext(
+                    "%(count)d skipped (does not meet the certificate conditions).",
+                    "%(count)d skipped (do not meet the certificate conditions).",
+                    value["not_qualified"],
+                )
+                % {"count": value["not_qualified"]}
+            )
+        if value["no_email"]:
+            parts.append(
+                ngettext(
+                    "%(count)d skipped (no email address on file).",
+                    "%(count)d skipped (no email address on file).",
+                    value["no_email"],
+                )
+                % {"count": value["no_email"]}
+            )
+        if value["failed"]:
+            parts.append(
+                ngettext(
+                    "%(count)d could not be generated. Try again later.",
+                    "%(count)d could not be generated. Try again later.",
+                    value["failed"],
+                )
+                % {"count": value["failed"]}
+            )
+        return " ".join(str(part) for part in parts) or _("No certificates were sent.")
+
+    def post(self, request, *args, **kwargs):
+        member_ids = [int(pk) for pk in request.POST.getlist("member_ids") if pk.isdigit()]
+        if not member_ids:
+            messages.warning(request, _("No members selected."))
+            return redirect(self.get_success_url(None))
+        return self.do(request.event.pk, member_ids)
 
 
 class VoucherSettingsView(PluginActiveMixin, TeamShiftsPermissionRequiredMixin, View):

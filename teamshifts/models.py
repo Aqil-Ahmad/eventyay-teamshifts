@@ -1,6 +1,6 @@
 import secrets
 
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.db import models
 from django.utils import timezone
 from django.utils.crypto import get_random_string
@@ -349,6 +349,13 @@ class TeamMemberApplication(models.Model):
 
     def __str__(self):
         return f"{self.user.email} ({self.get_status_display()})"
+
+    @property
+    def certificate_status(self) -> "CertificateStatus":
+        try:
+            return self.certificate.status
+        except ObjectDoesNotExist:
+            return CertificateStatus.NOT_GENERATED
 
 
 class Shift(models.Model):
@@ -729,6 +736,22 @@ class CertificateTrigger(models.TextChoices):
     MANUAL = "manual", _("Manually")
 
 
+class CertificateStatus(models.TextChoices):
+    NOT_GENERATED = "not_generated", _("Not generated")
+    GENERATED = "generated", _("Generated — not sent")
+    SENT = "sent", _("Sent — not downloaded")
+    DOWNLOADED = "downloaded", _("Downloaded")
+
+    @property
+    def label_class(self) -> str:
+        return {
+            CertificateStatus.NOT_GENERATED: "label-default",
+            CertificateStatus.GENERATED: "label-warning",
+            CertificateStatus.SENT: "label-info",
+            CertificateStatus.DOWNLOADED: "label-success",
+        }[self]
+
+
 def certificate_background_name(instance, filename: str) -> str:
     secret = get_random_string(16)
     return f"pub/{instance.event.organizer.slug}/{instance.event.slug}/teamshifts/certificates/bg-{instance.pk}-{secret}.pdf"
@@ -766,8 +789,21 @@ class CertificateSettings(models.Model):
     trigger = models.CharField(
         max_length=8,
         choices=CertificateTrigger.choices,
-        default=CertificateTrigger.AUTO,
+        default=CertificateTrigger.MANUAL,
         verbose_name=_("Certificate generation trigger"),
+    )
+    require_after_event_end = models.BooleanField(
+        default=False,
+        verbose_name=_("Only after the event has ended"),
+    )
+    after_event_end_issuing_since = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_("Automatic issuing after the event enabled at"),
+        help_text=_(
+            "Set when automatic generation and the after-event-end condition are both switched on. "
+            "Certificates are only issued at the end of the event if this was set before the event ended."
+        ),
     )
     layout = models.TextField(blank=True)
     background = models.FileField(null=True, blank=True, upload_to=certificate_background_name, max_length=255)
@@ -781,6 +817,10 @@ class CertificateSettings(models.Model):
 
     def __str__(self):
         return f"Certificates ({self.event.slug})"
+
+    @property
+    def issues_after_event_end(self) -> bool:
+        return self.trigger == CertificateTrigger.AUTO and self.require_after_event_end
 
 
 class MemberCertificate(models.Model):
@@ -796,7 +836,7 @@ class MemberCertificate(models.Model):
         null=True,
         blank=True,
         verbose_name=_("Notified at"),
-        help_text=_("Timestamp of the first certificate email notification. Null means no notification has been sent yet."),
+        help_text=_("Timestamp of the latest certificate email notification. Null means no notification has been sent yet."),
     )
 
     objects = ScopedManager(event="application__event")
@@ -807,6 +847,16 @@ class MemberCertificate(models.Model):
 
     def __str__(self):
         return f"Certificate for {self.application}"
+
+    @property
+    def status(self) -> str:
+        if self.downloaded_at:
+            return CertificateStatus.DOWNLOADED
+        if self.notified_at:
+            return CertificateStatus.SENT
+        if self.file:
+            return CertificateStatus.GENERATED
+        return CertificateStatus.NOT_GENERATED
 
 
 class VoucherStatus(models.TextChoices):
