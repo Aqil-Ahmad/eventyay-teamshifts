@@ -518,7 +518,7 @@ class EmailTemplatePreviewView(PluginActiveMixin, TeamShiftsPermissionRequiredMi
         sample_values = defaultdict(
             str,
             {
-                **{placeholder.identifier: str(placeholder.render_sample(event)) for placeholder in shared_event_placeholders()},
+                **{placeholder.identifier: placeholder.render_sample(event) for placeholder in shared_event_placeholders()},
                 "full_name": "Jane Doe",
                 "role_name": "Volunteer",
                 "shift_schedule_url": build_absolute_uri(event, "plugins:teamshifts:public_shift_schedule"),
