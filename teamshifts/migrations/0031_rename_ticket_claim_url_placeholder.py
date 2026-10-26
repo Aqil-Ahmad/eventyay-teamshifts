@@ -9,16 +9,16 @@ FIELDS = {
 }
 
 
-def renamed(value):
+def renamed(value, old, new):
     data = value.data if isinstance(value, LazyI18nString) else value
     if isinstance(data, dict):
-        return LazyI18nString({lang: rename_placeholder(text, "ticket_claim_url", "voucher_redeem_url") for lang, text in data.items()})
+        return LazyI18nString({lang: rename_placeholder(text, old, new) for lang, text in data.items()})
     if isinstance(data, str):
-        return LazyI18nString(rename_placeholder(data, "ticket_claim_url", "voucher_redeem_url"))
+        return LazyI18nString(rename_placeholder(data, old, new))
     return value
 
 
-def rename_ticket_claim_url(apps, schema_editor):
+def rename(apps, old, new):
     for model_name, fields in FIELDS.items():
         model = apps.get_model("teamshifts", model_name)
         for row in model.objects.all().iterator():
@@ -26,11 +26,19 @@ def rename_ticket_claim_url(apps, schema_editor):
             for field in fields:
                 value = getattr(row, field)
                 data = value.data if isinstance(value, LazyI18nString) else value
-                if data and "ticket_claim_url" in str(data):
-                    setattr(row, field, renamed(value))
+                if data and old in str(data):
+                    setattr(row, field, renamed(value, old, new))
                     changed.append(field)
             if changed:
                 row.save(update_fields=changed)
+
+
+def forwards(apps, schema_editor):
+    rename(apps, "ticket_claim_url", "voucher_redeem_url")
+
+
+def backwards(apps, schema_editor):
+    rename(apps, "voucher_redeem_url", "ticket_claim_url")
 
 
 class Migration(migrations.Migration):
@@ -39,5 +47,5 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RunPython(rename_ticket_claim_url, reverse_code=migrations.RunPython.noop),
+        migrations.RunPython(forwards, reverse_code=backwards),
     ]
