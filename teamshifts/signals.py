@@ -125,8 +125,8 @@ def _format_shift_time(shift):
 class TeamShiftsMailPlaceholder(SimpleFunctionalMailTextPlaceholder):
     """A placeholder offered only where the ``teamshifts`` context key is passed, so it stays out of other editors."""
 
-    def __init__(self, identifier, args, func, sample):
-        super().__init__(identifier, [MAIL_CONTEXT_KEY, *args], func, sample)
+    def __init__(self, identifier, args, func, sample, explanation=None):
+        super().__init__(identifier, [MAIL_CONTEXT_KEY, *args], func, sample, explanation)
 
     def render(self, context):
         return self._func(**{key: context[key] for key in self._args if key != MAIL_CONTEXT_KEY})
@@ -140,42 +140,49 @@ def teamshifts_mail_placeholders(sender, **kwargs):
             ["user"],
             lambda user: (getattr(user, "fullname", "") or user.email) if user else "",
             lambda event: _("Volunteer"),
+            _("The volunteer's full name"),
         ),
         TeamShiftsMailPlaceholder(
             "role_name",
             ["role"],
             lambda role: role.name if role else _("no specific role"),
             lambda event: _("Volunteer role"),
+            _("The assigned role name"),
         ),
         TeamShiftsMailPlaceholder(
             "shift_schedule_url",
             ["event"],
             lambda event: build_absolute_uri(event, "plugins:teamshifts:public_shift_schedule"),
             lambda event: "https://example.com/fossasia/my-event/teamshifts/shifts/",
+            _("Link to the shift schedule"),
         ),
         TeamShiftsMailPlaceholder(
             "shift_name",
             ["shift"],
             lambda shift: str(shift),
             lambda event: _("Morning Shift (2026-01-15 09:00 – 12:00)"),
+            _("The shift name"),
         ),
         TeamShiftsMailPlaceholder(
             "shift_time",
             ["shift"],
             _format_shift_time,
             lambda event: "2026-01-15 09:00 – 12:00",
+            _("The shift date and time range"),
         ),
         TeamShiftsMailPlaceholder(
             "applicant_name",
             ["application"],
             lambda application: application.user.fullname,
             lambda event: _("Applicant"),
+            _("The applicant's name"),
         ),
         TeamShiftsMailPlaceholder(
             "submitted_at",
             ["application"],
             lambda application: application.created_at.astimezone(application.event.tz).strftime("%Y-%m-%d %H:%M %Z"),
             lambda event: "",
+            _("When the application was submitted"),
         ),
         TeamShiftsMailPlaceholder(
             "pending_count",
@@ -185,6 +192,7 @@ def teamshifts_mail_placeholders(sender, **kwargs):
                 status=ApplicationStatus.PENDING,
             ).count(),
             lambda event: "0",
+            _("Number of applications waiting for review"),
         ),
         TeamShiftsMailPlaceholder(
             "application_url",
@@ -199,6 +207,7 @@ def teamshifts_mail_placeholders(sender, **kwargs):
                 },
             ),
             lambda event: "",
+            _("Link to review the application"),
         ),
     ]
 
