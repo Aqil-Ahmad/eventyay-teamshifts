@@ -114,7 +114,7 @@ _TEMPLATE_PLACEHOLDERS = [
     ("{shift_time}", _("The shift date and time range (shift emails only)")),
     ("{role_name}", _("The assigned role name (shift emails only)")),
     ("{voucher_code}", _("The volunteer's voucher code (voucher emails only)")),
-    ("{ticket_claim_url}", _("Link to claim the ticket (voucher emails only)")),
+    ("{voucher_redeem_url}", _("Link to claim the ticket (voucher emails only)")),
 ]
 
 
@@ -525,7 +525,7 @@ class EmailTemplatePreviewView(PluginActiveMixin, TeamShiftsPermissionRequiredMi
                 "shift_name": "Morning Shift (2026-01-15 09:00 – 12:00)",
                 "shift_time": "2026-01-15 09:00 – 12:00",
                 "voucher_code": "ABCD-1234-EFGH",
-                "ticket_claim_url": build_absolute_uri(event, "presale:event.redeem") + "?voucher=ABCD-1234-EFGH",
+                "voucher_redeem_url": build_absolute_uri(event, "presale:event.redeem") + "?voucher=ABCD-1234-EFGH",
             },
         )
 

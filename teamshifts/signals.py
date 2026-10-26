@@ -166,18 +166,6 @@ def teamshifts_mail_placeholders(sender, **kwargs):
             lambda event: "2026-01-15 09:00 – 12:00",
         ),
         TeamShiftsMailPlaceholder(
-            "voucher_code",
-            ["voucher_code"],
-            lambda voucher_code: voucher_code,
-            "ABCD-1234-EFGH",
-        ),
-        TeamShiftsMailPlaceholder(
-            "ticket_claim_url",
-            ["ticket_claim_url"],
-            lambda ticket_claim_url: ticket_claim_url,
-            "https://example.com/my-event/?voucher=ABCD-1234-EFGH",
-        ),
-        TeamShiftsMailPlaceholder(
             "applicant_name",
             ["application"],
             lambda application: application.user.fullname,
