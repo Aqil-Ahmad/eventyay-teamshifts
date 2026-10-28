@@ -71,7 +71,7 @@ def test_voucher_placeholders_are_only_offered_in_the_voucher_template(event):
         accepted_names = placeholder_names(event, mail_context(EmailTemplateRoles.APPLICATION_ACCEPTED))
 
     assert {"voucher_code", "voucher_redeem_url"} <= set(voucher_names)
-    assert not {"voucher_code", "voucher_redeem_url", "shift_name"} & set(compose_names)
+    assert not {"voucher_code", "voucher_redeem_url", "shift_name", "role_name"} & set(compose_names)
     assert not {"voucher_code", "voucher_redeem_url", "shift_name"} & set(accepted_names)
 
 
